@@ -9,16 +9,20 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .planning import TrainingService
 from .service import DomainService
 from .storage import Database
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          training: TrainingService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
     body = body or {}
+    if training is None:
+        training = TrainingService(service.database, service.clock)
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
     try:
@@ -48,6 +52,73 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+
+        # ------------------------------------------------- 训练主数据登记
+        if method == "POST" and parsed.path == "/teams":
+            result = training.register_team(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/persons":
+            result = training.register_person(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/team-members":
+            result = training.add_team_members(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/task-templates":
+            result = training.register_template(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/training-areas":
+            result = training.register_area(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/equipment":
+            result = training.register_equipment(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/equipment-status":
+            result = training.set_equipment_status(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/restrictions":
+            result = training.register_restriction(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/restrictions/escalate":
+            result = training.escalate_restriction(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+
+        # ------------------------------------------------- 候选、放行与执行
+        if method == "POST" and parsed.path == "/plans/generate":
+            result = training.generate_plan(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/plans/release":
+            result = training.release_plan(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/task-events":
+            result = training.ingest_task_event(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/tasks/manual-resolve":
+            result = training.manual_resolve_task(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/telemetry-summaries":
+            result = training.ingest_telemetry_summary(actor_id=actor_id, **body)
+            return 200 if result.get("replayed") else 201, result
+        if method == "POST" and parsed.path == "/reviews/run-pending":
+            return 200, training.run_pending_reviews(body.get("limit", 50))
+
+        if method == "GET" and parsed.path.startswith("/plans/"):
+            return 200, training.get_plan(parsed.path.split("/")[2])
+        if method == "GET" and parsed.path == "/plans":
+            query = parse_qs(parsed.query)
+            plan_key = query.get("plan_key", [""])[0]
+            if not plan_key:
+                raise ValidationError("plan_key 不能为空")
+            return 200, {"items": training.list_plan_versions(plan_key)}
+        if method == "GET" and parsed.path.startswith("/tasks/"):
+            return 200, training.get_task(parsed.path.split("/")[2])
+        if method == "GET" and parsed.path == "/tasks":
+            query = parse_qs(parsed.query)
+            site_id = query.get("site_id", [""])[0]
+            if not site_id:
+                raise ValidationError("site_id 不能为空")
+            state = query.get("state", [None])[0]
+            return 200, {"items": training.list_tasks(site_id, state)}
+
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -59,6 +130,7 @@ class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    training: TrainingService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +141,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                self.training)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +173,11 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    Handler.training = TrainingService(database, Handler.service.clock)
+    # 进程重启后继续完成尚未处理的待复盘记录。
+    resumed = Handler.training.resume_pending_work()
+    if resumed["processed"]:
+        print(f"启动续办完成待复盘记录 {resumed['processed']} 条")
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
